@@ -1,0 +1,162 @@
+# GitHub Actions workflow to mirror specific branches to a GitLab repository.
+#
+# Copyright (c) 2025, Magenest JSC. All rights reserved.
+# Author: Vu Thanh Thao <thaovt@magenest.com>
+
+name: Mirror to GitLab (auto-merge per-branch)
+
+on:
+  workflow_call:
+    inputs:
+      concurrency_key:
+        description: "Lock concurrency; default per branch"
+        required: false
+        type: string
+        default: ""
+      git_user_name:
+        description: "Bot git name"
+        required: false
+        type: string
+        default: "GitHub Mirror Bot"
+      git_user_email:
+        description: "Email bot git"
+        required: false
+        type: string
+        default: "mirror-bot@users.noreply.github.com"
+    secrets:
+      GITLAB_TOKEN:
+        required: true
+      GITLAB_REPO:
+        required: true
+
+# Needed so the workflow can push back to GitHub (during auto-merge).
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    name: Mirror the current branch to GitLab
+    runs-on: ubuntu-latest
+
+    # Prevent concurrent mirrors per-branch (avoid race conditions).
+    concurrency:
+      group: ${{ inputs.concurrency_key != '' && inputs.concurrency_key || format('mirror-{0}', github.ref_name) }}
+      cancel-in-progress: true
+
+    # Common environment values available to all steps.
+    env:
+      # The source branch being pushed (e.g., "main" or "develop").
+      MIRROR_BRANCH: ${{ github.ref_name }}
+
+    steps:
+      ## 0) Log context + check author
+      #- name: Log push context and check author
+      #  id: author_check
+      #  run: |
+      #    echo "### 📝 'github.event' JSON" >> "$GITHUB_STEP_SUMMARY"
+      #    echo '${{ toJson(github.event) }}' >> "$GITHUB_STEP_SUMMARY"
+      #    echo "### 🔎 Push Context" >> "$GITHUB_STEP_SUMMARY"
+      #    echo "- github.actor: $GITHUB_ACTOR" >> "$GITHUB_STEP_SUMMARY"
+      #    echo "- github.event_name: $GITHUB_EVENT_NAME" >> "$GITHUB_STEP_SUMMARY"
+      #    echo "- branch: $GITHUB_REF_NAME" >> "$GITHUB_STEP_SUMMARY"
+
+      # 1) Check out repository with full history
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2) Configure Git identity and add the GitLab remote using a Personal Access Token.
+      - name: Configure Git and add GitLab remote
+        id: setup
+        env:
+          # Secret: GitLab Personal Access Token (min scope: write_repository)
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          # Secret: GitLab repo URL, e.g., https://gitlab.com/group/project.git
+          GITLAB_REPO: ${{ secrets.GITLAB_REPO }}
+        run: |
+          # --- Precheck required secrets (fail immediately if missing) ---
+          if [ -z "${GITLAB_TOKEN}" ] || [ -z "${GITLAB_REPO}" ]; then
+            echo "ready=no" >> "$GITHUB_OUTPUT"
+            echo "### ❌ Failed: missing required secrets (GITLAB_TOKEN and/or GITLAB_REPO)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Set a neutral bot identity for merge commits.
+          git config --global user.name  "${{ inputs.git_user_name }}"
+          git config --global user.email "${{ inputs.git_user_email }}"
+         
+          # Avoid "detected dubious ownership" warnings on the runner.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # Add GitLab remote with OAuth2 token injected in the URL.
+          # ${GITLAB_REPO#https://} strips the leading 'https://' to safely inject credentials.
+          git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@${GITLAB_REPO#https://}"
+
+          # Fetch the corresponding branch from GitLab (it may not exist yet).
+          git fetch gitlab +refs/heads/${MIRROR_BRANCH}:refs/remotes/gitlab/${MIRROR_BRANCH} || true
+
+          # Define canonical refs for both sides:
+          # - GH_REF refers to the checked-out commit (HEAD) from GitHub.
+          # - GL_REF points to the fetched GitLab remote-tracking branch (if any).
+          echo "GH_REF=HEAD" >> $GITHUB_ENV
+          echo "GL_REF=refs/remotes/gitlab/${MIRROR_BRANCH}" >> $GITHUB_ENV
+
+      # 3) Guard: skip the job if GitHub and GitLab are already in sync (same tip commit).
+      - name: Guard — skip when already in sync
+        id: guard
+        run: |
+          # Resolve SHAs for GitHub (HEAD) and GitLab (if branch exists).
+          GH_SHA=$(git rev-parse "$GH_REF")
+          #GL_SHA=$(git rev-parse "$GL_REF" 2>/dev/null || echo "")
+          
+          if ! GL_SHA=$(git rev-parse "$GL_REF" 2>gl_err.log); then
+            echo "### ❌ Error: Cannot resolve GitLab ref '$GL_REF'" >> "$GITHUB_STEP_SUMMARY"
+            echo "#### Git error output:" >> "$GITHUB_STEP_SUMMARY"
+            cat gl_err.log >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Export for later steps.
+          echo "GH_SHA=$GH_SHA" >> $GITHUB_ENV
+          echo "GL_SHA=$GL_SHA" >> $GITHUB_ENV
+
+          # If both SHAs match, nothing to do.
+          if [ "$GH_SHA" = "$GL_SHA" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "### ✅ Skipped: '${MIRROR_BRANCH}' is already in sync." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # 4) Fast-forward GitLab when possible (GitLab is behind or branch doesn't exist there).
+      - name: Fast-forward GitLab when possible
+        id: ff_gitlab
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          # Fast-forward is possible when:
+          # - GitLab branch doesn't exist (GL_SHA == none), OR
+          # - GitLab tip is an ancestor of GitHub tip (GL → GH is FF).
+          if [ "$GL_SHA" = "none" ] || git merge-base --is-ancestor "$GL_REF" "$GH_REF"; then
+            git push gitlab "$GH_REF:refs/heads/${MIRROR_BRANCH}"
+            echo "mode=ff" >> "$GITHUB_OUTPUT"
+            echo "### ⏩ Fast-forwarded: pushed '${MIRROR_BRANCH}' from GitHub to GitLab." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # 5) Auto-merge (no-conflict) and push to both sides when FF is not possible.
+      - name: Auto-merge (no conflict) then push to GitHub and GitLab
+        id: auto_merge
+        if: steps.guard.outputs.skip != 'true' && steps.ff_gitlab.outputs.mode != 'ff'
+        run: |
+          # Create/update a local branch at GitHub's tip (HEAD) to receive the merge.
+          git checkout -B "${MIRROR_BRANCH}" "$GH_REF"
+
+          # Attempt a non-fast-forward merge with GitLab's branch tip.
+          # If conflicts arise, we fail the job and require manual resolution.
+          if git merge --no-ff --no-edit "$GL_REF"; then
+            # Push the merge commit back to GitHub and to GitLab to keep both sides aligned.
+            git push origin "${MIRROR_BRANCH}"
+            git push gitlab "${MIRROR_BRANCH}"
+            echo "### 🔀 Auto-merged: clean merge created and pushed to both GitHub & GitLab." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ⚠️ Merge conflict: manual resolution required. Aborting." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
